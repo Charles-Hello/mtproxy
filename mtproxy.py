@@ -435,25 +435,11 @@ def get_curr_connects_count():
 
 
 def get_to_tg_bufsize():
-    # OPTIMIZATION: Use a fixed large buffer size
     return 131072
-    # Original adaptive logic:
-    # if isinstance(config.TO_TG_BUFSIZE, int):
-    #     return config.TO_TG_BUFSIZE
-    #
-    # low, margin, high = config.TO_TG_BUFSIZE
-    # return high if get_curr_connects_count() < margin else low
 
 
 def get_to_clt_bufsize():
-    # OPTIMIZATION: Use a fixed large buffer size
     return 131072
-    # Original adaptive logic:
-    # if isinstance(config.TO_CLT_BUFSIZE, int):
-    #     return config.TO_CLT_BUFSIZE
-    #
-    # low, margin, high = config.TO_CLT_BUFSIZE
-    # return high if get_curr_connects_count() < margin else low
 
 
 class MyRandom(random.Random):
@@ -485,7 +471,7 @@ myrandom = MyRandom()
 
 
 class TgConnectionPool:
-    MAX_CONNS_IN_POOL = 0
+    MAX_CONNS_IN_POOL = 64  # Increased from 0
 
     def __init__(self):
         self.pools = {}
@@ -503,35 +489,37 @@ class TgConnectionPool:
         return reader_tgt, writer_tgt
 
     def register_host_port(self, host, port, init_func):
-        if (host, port, init_func) not in self.pools:
-            self.pools[(host, port, init_func)] = []
+        key = (host, port, init_func)
+        if key not in self.pools:
+            self.pools[key] = []
 
-        while len(self.pools[(host, port, init_func)]) < TgConnectionPool.MAX_CONNS_IN_POOL:
+        while len(self.pools[key]) < self.MAX_CONNS_IN_POOL:
             connect_task = asyncio.ensure_future(self.open_tg_connection(host, port, init_func))
-            self.pools[(host, port, init_func)].append(connect_task)
+            self.pools[key].append(connect_task)
 
     async def get_connection(self, host, port, init_func=None):
+        key = (host, port, init_func)
         self.register_host_port(host, port, init_func)
 
-        ret = None
-        for task in self.pools[(host, port, init_func)][::]:
+        # Try to find a ready connection first
+        for task in self.pools[key][:]:
             if task.done():
                 if task.exception():
-                    self.pools[(host, port, init_func)].remove(task)
+                    self.pools[key].remove(task)
                     continue
 
                 reader, writer, *other = task.result()
                 if writer.transport.is_closing():
-                    self.pools[(host, port, init_func)].remove(task)
+                    self.pools[key].remove(task)
                     continue
 
-                if not ret:
-                    self.pools[(host, port, init_func)].remove(task)
-                    ret = (reader, writer, *other)
+                self.pools[key].remove(task)
+                # Create a new connection task to replace the used one
+                new_task = asyncio.ensure_future(self.open_tg_connection(host, port, init_func))
+                self.pools[key].append(new_task)
+                return (reader, writer, *other)
 
-        self.register_host_port(host, port, init_func)
-        if ret:
-            return ret
+        # If no ready connection found, open a new one
         return await self.open_tg_connection(host, port, init_func)
 
 
@@ -642,7 +630,6 @@ class CryptoWrappedStreamReader(LayeredStreamReaderBase):
     __slots__ = ('decryptor', 'block_size', 'buf')
 
     def __init__(self, upstream, decryptor, block_size=1):
-        # Ensure LayeredStreamReaderBase.__init__ is called if needed
         super().__init__(upstream)
         self.upstream = upstream
         self.decryptor = decryptor
@@ -654,59 +641,41 @@ class CryptoWrappedStreamReader(LayeredStreamReaderBase):
             ret = bytes(self.buf)
             self.buf.clear()
             return ret
-        else:
-            data = await self.upstream.read(n) # Read up to n bytes
-            if not data:
-                return b""
 
-            # --- OPTIMIZATION START ---
-            # Only align if block_size > 1 (e.g., for CBC)
-            if self.block_size > 1:
-                needed_till_full_block = -len(data) % self.block_size
-                if needed_till_full_block > 0:
-                    # This might still block, unavoidable if upstream sends partial blocks
-                    try:
-                        data += await self.upstream.readexactly(needed_till_full_block)
-                    except asyncio.IncompleteReadError:
-                        # Handle cases where the upstream closes unexpectedly after sending partial block data
-                        # Decrypt what we have, the caller will likely get an error on next read.
-                        pass # Fall through to decrypt the incomplete data
-            # --- OPTIMIZATION END ---
+        data = await self.upstream.read(n)
+        if not data:
+            return b""
 
-            # Decrypt whatever we managed to read (potentially incomplete if error occurred during alignment)
-            return self.decryptor.decrypt(data)
+        # Only align if block_size > 1 (e.g., for CBC)
+        if self.block_size > 1:
+            needed_till_full_block = -len(data) % self.block_size
+            if needed_till_full_block > 0:
+                try:
+                    data += await self.upstream.readexactly(needed_till_full_block)
+                except asyncio.IncompleteReadError:
+                    pass
+
+        return self.decryptor.decrypt(data)
 
     async def readexactly(self, n):
         if n > len(self.buf):
             to_read = n - len(self.buf)
-
-            # --- OPTIMIZATION START ---
+            
             # Only align read amount if block_size > 1
             if self.block_size > 1:
                 needed_till_full_block = -to_read % self.block_size
                 to_read_block_aligned = to_read + needed_till_full_block
             else:
-                to_read_block_aligned = to_read # Read exactly what's needed for CTR
-            # --- OPTIMIZATION END ---
+                to_read_block_aligned = to_read
 
-            # Read the calculated amount (exact for CTR, block-aligned for CBC)
-            # Add error handling for unexpected EOF during readexactly
             try:
                 data = await self.upstream.readexactly(to_read_block_aligned)
+                self.buf += self.decryptor.decrypt(data)
             except asyncio.IncompleteReadError as e:
-                 # If EOF occurs while trying to read aligned data, decrypt what was partially read before raising
-                 if e.partial:
-                     self.buf += self.decryptor.decrypt(e.partial)
-                 # Re-raise the original error after potentially decrypting partial data
-                 raise e
-
-            # Decrypt and append to buffer
-            self.buf += self.decryptor.decrypt(data)
-
-        # This slicing might still be a minor inefficiency, but harder to optimize cleanly
-        # Check if we actually got enough data after potential partial reads/decryption from errors
-        if len(self.buf) < n:
-            raise asyncio.IncompleteReadError(f"Expected {n} bytes after potential partial reads, got {len(self.buf)}", len(self.buf))
+                if e.partial:
+                    self.buf += self.decryptor.decrypt(e.partial)
+                if len(self.buf) < n:
+                    raise asyncio.IncompleteReadError(f"Expected {n} bytes after potential partial reads, got {len(self.buf)}", len(self.buf))
 
         ret = bytes(self.buf[:n])
         self.buf = self.buf[n:]
