@@ -1,0 +1,16 @@
+services:
+  mtprotoproxy:
+    image: ghcr.io/admin8800/mtprotoproxy:latest
+    container_name: mtp
+    restart: unless-stopped
+    network_mode: "host"
+    volumes:
+      - ./config.py:/home/tgproxy/config.py
+      - ./mtprotoproxy.py:/home/tgproxy/mtprotoproxy.py
+      - /etc/localtime:/etc/localtime:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "5"
+        max-size: "10m"
+   # mem_limit: 2048m
